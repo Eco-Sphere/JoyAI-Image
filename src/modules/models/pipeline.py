@@ -17,6 +17,7 @@
 #
 # ==============================================================================
 import inspect
+import os
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 import torch
 import torch.distributed as dist
@@ -42,6 +43,12 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
 
 from modules.models.mmdit.dit import Transformer3DModel
+
+try:
+    from mindiesd import CacheAgent, CacheConfig
+except Exception:
+    CacheAgent = None
+    CacheConfig = None
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -177,6 +184,12 @@ class Pipeline(DiffusionPipeline):
             'multiple_images': 34,
             'video': 91,
         }
+        self._dit_cache_steps_count: Optional[int] = None
+        self._dit_cache_announced = False
+        if not hasattr(self.transformer, "cache_cond"):
+            self.transformer.cache_cond = None
+        if not hasattr(self.transformer, "cache_uncond"):
+            self.transformer.cache_uncond = None
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
@@ -601,6 +614,198 @@ class Pipeline(DiffusionPipeline):
             )
         return torch.cat([x, padding], dim=1)
 
+    def _cfg_parallel_enabled(self) -> bool:
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        world_size = dist.get_world_size()
+        ulysses_size = int(os.environ.get("ULYSSES_SIZE", "1"))
+        cfg_size_raw = os.environ.get("CFG_SIZE", "auto").strip().lower()
+
+        if cfg_size_raw in ("", "auto"):
+            # Backward-compatible default:
+            # - world_size==2 and no sequence parallel -> enable cfg parallel
+            # - otherwise -> disable cfg parallel
+            cfg_size = 2 if (world_size == 2 and ulysses_size == 1) else 1
+        else:
+            try:
+                cfg_size = int(cfg_size_raw)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"CFG_SIZE must be one of: auto, 1, 2; got {cfg_size_raw!r}."
+                ) from exc
+            if cfg_size not in (1, 2):
+                raise RuntimeError(
+                    f"CFG_SIZE must be one of: auto, 1, 2; got {cfg_size}."
+                )
+
+        if cfg_size == 1:
+            return False
+
+        # cfg_size == 2 path
+        if ulysses_size > 1:
+            raise RuntimeError(
+                f"CFG_SIZE=2 is incompatible with ULYSSES_SIZE={ulysses_size}. "
+                "Please set ULYSSES_SIZE=1 or CFG_SIZE=1."
+            )
+        if world_size != 2:
+            raise RuntimeError(
+                f"CFG_SIZE=2 currently requires WORLD_SIZE=2, but got WORLD_SIZE={world_size}."
+            )
+        return True
+
+    @staticmethod
+    def _cfg_parallel_rank() -> int:
+        if not dist.is_available() or not dist.is_initialized():
+            return 0
+        return dist.get_rank()
+
+    @staticmethod
+    def _all_gather_cfg_noise_pred(
+        noise_pred: torch.Tensor,
+        gathered: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("CFG parallel all_gather requires initialized torch.distributed.")
+        world_size = dist.get_world_size()
+        if world_size != 2:
+            raise RuntimeError(f"CFG parallel expects world_size == 2, but got {world_size}.")
+        dist.all_gather(gathered, noise_pred)
+        # rank 0 computes unconditional branch, rank 1 computes conditional branch
+        return gathered[0], gathered[1]
+
+    @staticmethod
+    def _get_dit_cache_flags() -> Tuple[bool, bool]:
+        def _env_to_bool(name: str) -> bool:
+            value = os.environ.get(name, "0")
+            try:
+                return bool(int(value))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Environment variable {name} must be 0 or 1, but got {value!r}."
+                ) from exc
+
+        return _env_to_bool("COND_CACHE"), _env_to_bool("UNCOND_CACHE")
+
+    @staticmethod
+    def _get_dit_cache_method() -> str:
+        # Keep a fixed, known set of methods from checked-in references:
+        # - Qwen-Image: dit_block_cache
+        # - FLUX.2-dev: attention_cache
+        attention_cache_enabled = os.environ.get("ATTENTION_CACHE", "0").strip()
+        try:
+            if bool(int(attention_cache_enabled)):
+                return "attention_cache"
+        except ValueError as exc:
+            raise ValueError(
+                f"Environment variable ATTENTION_CACHE must be 0 or 1, but got {attention_cache_enabled!r}."
+            ) from exc
+        return "dit_block_cache"
+
+    def _ensure_dit_cache_agents(
+        self,
+        num_inference_steps: int,
+        cond_cache_enabled: bool,
+        uncond_cache_enabled: bool,
+        cache_method: str,
+    ) -> None:
+        if not (cond_cache_enabled or uncond_cache_enabled):
+            return
+        if CacheConfig is None or CacheAgent is None:
+            raise RuntimeError(
+                "COND_CACHE/UNCOND_CACHE is enabled but mindiesd cache modules are unavailable."
+            )
+
+        block_count = len(getattr(self.transformer, "double_blocks", []))
+        if block_count <= 0:
+            raise RuntimeError("Transformer does not expose double_blocks; cannot enable DiT block cache.")
+
+        has_cond_agent = getattr(self.transformer, "cache_cond", None) is not None
+        has_uncond_agent = getattr(self.transformer, "cache_uncond", None) is not None
+        cache_matches_steps = self._dit_cache_steps_count == int(num_inference_steps)
+        if (
+            cache_matches_steps
+            and (not cond_cache_enabled or has_cond_agent)
+            and (not uncond_cache_enabled or has_uncond_agent)
+        ):
+            return
+
+        max_step_index = max(0, int(num_inference_steps) - 1)
+        step_interval = 3
+        if cache_method == "attention_cache":
+            # FLUX.2-dev reference: step_start=5, step_interval=3, step_end=45.
+            step_start = min(5, max_step_index)
+            step_end = min(45, max_step_index)
+            if step_end < step_start:
+                step_end = step_start
+            try:
+                cache_config = CacheConfig(
+                    method=cache_method,
+                    blocks_count=block_count,
+                    steps_count=int(num_inference_steps),
+                    step_start=step_start,
+                    step_interval=step_interval,
+                    step_end=step_end,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to create CacheConfig with method={cache_method!r}. "
+                    "Current supported methods: dit_block_cache, attention_cache."
+                ) from exc
+        elif cache_method == "dit_block_cache":
+            # Qwen-Image reference: step_start=10, step_interval=3, step_end=35, block=[10,50].
+            step_start = min(10, max_step_index)
+            step_end = min(35, max_step_index)
+            if step_end < step_start:
+                step_end = step_start
+
+            max_block_index = max(0, block_count - 1)
+            block_start = min(10, max_block_index)
+            block_end = min(50, max_block_index)
+            if block_end < block_start:
+                block_end = block_start
+
+            try:
+                cache_config = CacheConfig(
+                    method=cache_method,
+                    blocks_count=block_count,
+                    steps_count=int(num_inference_steps),
+                    step_start=step_start,
+                    step_interval=step_interval,
+                    step_end=step_end,
+                    block_start=block_start,
+                    block_end=block_end,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to create CacheConfig with method={cache_method!r}. "
+                    "Current supported methods: dit_block_cache, attention_cache."
+                ) from exc
+        else:
+            raise RuntimeError(
+                f"Unsupported cache method: {cache_method!r}. "
+                "Current supported methods: dit_block_cache, attention_cache."
+            )
+
+        self.transformer.cache_cond = CacheAgent(cache_config) if cond_cache_enabled else None
+        self.transformer.cache_uncond = CacheAgent(cache_config) if uncond_cache_enabled else None
+        self._dit_cache_steps_count = int(num_inference_steps)
+
+        is_rank0 = (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+        if is_rank0 and not self._dit_cache_announced:
+            logger.info(
+                "Enable transformer cache: method=%s, cond=%s, uncond=%s, blocks=%s, steps=%s",
+                cache_method,
+                cond_cache_enabled,
+                uncond_cache_enabled,
+                block_count,
+                num_inference_steps,
+            )
+            self._dit_cache_announced = True
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -743,6 +948,11 @@ class Pipeline(DiffusionPipeline):
 
         self._guidance_scale = guidance_scale
         self._interrupt = False
+        cfg_parallel_enabled = (
+            self.do_classifier_free_guidance and self._cfg_parallel_enabled()
+        )
+        cfg_parallel_rank = self._cfg_parallel_rank() if cfg_parallel_enabled else 0
+        cfg_gathered_noise_pred: Optional[List[torch.Tensor]] = None
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -769,9 +979,9 @@ class Pipeline(DiffusionPipeline):
             template_type=template_type,
             drop_vit_feature=drop_vit_feature,
         )
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
+        # For classifier free guidance, we need cond + uncond branches.
+        # In single-rank mode we concatenate branches in batch dimension.
+        # In cfg-parallel mode (world_size == 2), each rank runs one branch.
         if self.do_classifier_free_guidance:
             if negative_prompt is None and negative_prompt_embeds is None:
                 # default_negative_prompt = 'low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers.'  # noqa
@@ -797,14 +1007,34 @@ class Pipeline(DiffusionPipeline):
 
             max_seq_len = max(
                 prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
-            prompt_embeds = torch.cat([
-                self.pad_sequence(negative_prompt_embeds, max_seq_len),
-                self.pad_sequence(prompt_embeds, max_seq_len)])
+            cond_prompt_embeds = self.pad_sequence(prompt_embeds, max_seq_len)
+            uncond_prompt_embeds = self.pad_sequence(
+                negative_prompt_embeds, max_seq_len
+            )
+
+            cond_prompt_embeds_mask = prompt_embeds_mask
+            uncond_prompt_embeds_mask = negative_prompt_embeds_mask
             if prompt_embeds_mask is not None:
-                prompt_embeds_mask = torch.cat([
-                    self.pad_sequence(
-                        negative_prompt_embeds_mask, max_seq_len),
-                    self.pad_sequence(prompt_embeds_mask, max_seq_len)])
+                cond_prompt_embeds_mask = self.pad_sequence(
+                    prompt_embeds_mask, max_seq_len
+                )
+                uncond_prompt_embeds_mask = self.pad_sequence(
+                    negative_prompt_embeds_mask, max_seq_len
+                )
+
+            if cfg_parallel_enabled:
+                # Keep cond/uncond branches on different ranks and all_gather after forward.
+                prompt_embeds = cond_prompt_embeds
+                negative_prompt_embeds = uncond_prompt_embeds
+                prompt_embeds_mask = cond_prompt_embeds_mask
+                negative_prompt_embeds_mask = uncond_prompt_embeds_mask
+            else:
+                # Single-rank fallback: batch-concat cond/uncond and split after one forward.
+                prompt_embeds = torch.cat([uncond_prompt_embeds, cond_prompt_embeds])
+                if cond_prompt_embeds_mask is not None:
+                    prompt_embeds_mask = torch.cat(
+                        [uncond_prompt_embeds_mask, cond_prompt_embeds_mask]
+                    )
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -813,6 +1043,14 @@ class Pipeline(DiffusionPipeline):
             device,
             timesteps,
             sigmas,
+        )
+        cond_cache_enabled, uncond_cache_enabled = self._get_dit_cache_flags()
+        cache_method = self._get_dit_cache_method()
+        self._ensure_dit_cache_agents(
+            num_inference_steps=num_inference_steps,
+            cond_cache_enabled=cond_cache_enabled,
+            uncond_cache_enabled=uncond_cache_enabled,
+            cache_method=cache_method,
         )
 
         # 5. Prepare latent variables
@@ -866,34 +1104,121 @@ class Pipeline(DiffusionPipeline):
                 else:
                     latents_ = latents
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents_] * 2)
-                    if self.do_classifier_free_guidance
-                    else latents_
-                )
+                noise_pred_uncond = None
+                noise_pred_text = None
 
-                t_expand = t.repeat(latent_model_input.shape[0])
+                if cfg_parallel_enabled:
+                    # rank 0: uncond branch; rank 1: cond branch
+                    latent_model_input = latents_
+                    branch_is_cond = cfg_parallel_rank != 0
+                    local_prompt_embeds = (
+                        prompt_embeds if branch_is_cond else negative_prompt_embeds
+                    )
+                    local_prompt_embeds_mask = (
+                        prompt_embeds_mask if branch_is_cond else negative_prompt_embeds_mask
+                    )
+                    local_use_cache = (
+                        cond_cache_enabled if branch_is_cond else uncond_cache_enabled
+                    )
+                    t_expand = t.repeat(latent_model_input.shape[0])
 
-                # predict the noise residual
-                with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    with torch.autocast(
+                        device_type=latent_model_input.device.type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=t_expand,
+                            encoder_hidden_states=local_prompt_embeds,
+                            encoder_hidden_states_mask=local_prompt_embeds_mask,
+                            return_dict=False,
+                            use_cache=local_use_cache,
+                            if_cond=branch_is_cond,
+                        )[0]
+                        if (noise_pred.isnan()).any() or (noise_pred.isinf()).any():
+                            print("handle with nan/inf data")
+                elif self.do_classifier_free_guidance and (
+                    cond_cache_enabled or uncond_cache_enabled
                 ):
-                    noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        # [2, 16, 33, 24, 42]
-                        hidden_states=latent_model_input,
-                        timestep=t_expand,  # [2]
-                        encoder_hidden_states=prompt_embeds,  # [2, 256, 4096]
-                        # [2, 256]
-                        encoder_hidden_states_mask=prompt_embeds_mask,
-                        return_dict=False,
-                    )[0]
-                    if (noise_pred.isnan()).any() or (noise_pred.isinf()).any():
-                        print("handle with nan/inf data")
+                    # Single-rank CFG with cache: run cond/uncond forward separately.
+                    latent_model_input = latents_
+                    t_expand = t.repeat(latent_model_input.shape[0])
+
+                    with torch.autocast(
+                        device_type=latent_model_input.device.type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        noise_pred_text = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=t_expand,
+                            encoder_hidden_states=cond_prompt_embeds,
+                            encoder_hidden_states_mask=cond_prompt_embeds_mask,
+                            return_dict=False,
+                            use_cache=cond_cache_enabled,
+                            if_cond=True,
+                        )[0]
+                        noise_pred_uncond = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=t_expand,
+                            encoder_hidden_states=uncond_prompt_embeds,
+                            encoder_hidden_states_mask=uncond_prompt_embeds_mask,
+                            return_dict=False,
+                            use_cache=uncond_cache_enabled,
+                            if_cond=False,
+                        )[0]
+                        if (noise_pred_text.isnan()).any() or (noise_pred_text.isinf()).any():
+                            print("handle with nan/inf data (cond)")
+                        if (noise_pred_uncond.isnan()).any() or (noise_pred_uncond.isinf()).any():
+                            print("handle with nan/inf data (uncond)")
+                else:
+                    # Default path: single forward (concat cond/uncond when CFG is enabled).
+                    latent_model_input = (
+                        torch.cat([latents_] * 2)
+                        if self.do_classifier_free_guidance
+                        else latents_
+                    )
+                    t_expand = t.repeat(latent_model_input.shape[0])
+
+                    with torch.autocast(
+                        device_type=latent_model_input.device.type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=t_expand,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states_mask=prompt_embeds_mask,
+                            return_dict=False,
+                            use_cache=(cond_cache_enabled and not self.do_classifier_free_guidance),
+                            if_cond=True,
+                        )[0]
+                        if (noise_pred.isnan()).any() or (noise_pred.isinf()).any():
+                            print("handle with nan/inf data")
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    if cfg_parallel_enabled:
+                        if (
+                            cfg_gathered_noise_pred is None
+                            or cfg_gathered_noise_pred[0].shape != noise_pred.shape
+                            or cfg_gathered_noise_pred[0].dtype != noise_pred.dtype
+                            or cfg_gathered_noise_pred[0].device != noise_pred.device
+                        ):
+                            cfg_gathered_noise_pred = [
+                                torch.empty_like(noise_pred),
+                                torch.empty_like(noise_pred),
+                            ]
+                        noise_pred_uncond, noise_pred_text = (
+                            self._all_gather_cfg_noise_pred(
+                                noise_pred, cfg_gathered_noise_pred
+                            )
+                        )
+                    else:
+                        if noise_pred_uncond is None or noise_pred_text is None:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
@@ -969,3 +1294,4 @@ class Pipeline(DiffusionPipeline):
             return image
 
         return PipelineOutput(videos=image)
+

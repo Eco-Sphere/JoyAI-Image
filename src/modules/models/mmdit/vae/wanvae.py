@@ -555,6 +555,8 @@ class WanVAE_(nn.Module):
             else:
                 z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
+        if z.dtype != self.conv2.weight.dtype:
+            z=z.to(self.conv2.weight.dtype)
         x = self.conv2(z)
         for i in range(iter_):
             self._conv_idx = [0]
@@ -665,6 +667,13 @@ class WanxVAE(nn.Module):
         self.ffactor_spatial = 8
         self.ffactor_temporal = 4
         self.config.latent_channels = 16
+        # Default keeps legacy behavior (sample-by-sample decode).
+        self.decode_batch_size = 1
+        self.use_tiling = False
+        self.use_slicing = False
+        # Tiling is applied in latent space [H, W].
+        self.tile_latent_min_size = 64
+        self.tile_overlap_factor = 0.25
         
         # init model
         self.model = _video_vae(
@@ -686,12 +695,170 @@ class WanxVAE(nn.Module):
                 latents = self.model.encode(videos, scale=self.scale)
                 return latents
 
+    def enable_tiling(self):
+        self.use_tiling = True
+
+    def disable_tiling(self):
+        self.use_tiling = False
+
+    def enable_slicing(self):
+        self.use_slicing = True
+
+    def disable_slicing(self):
+        self.use_slicing = False
+
+    @staticmethod
+    def _tile_starts(length: int, tile_size: int, stride: int) -> list[int]:
+        if length <= tile_size:
+            return [0]
+        starts = list(range(0, max(1, length - tile_size + 1), stride))
+        last = length - tile_size
+        if starts[-1] != last:
+            starts.append(last)
+        return starts
+
+    @staticmethod
+    def _build_blend_weight(
+        tile_h: int,
+        tile_w: int,
+        overlap_px: int,
+        has_top: bool,
+        has_bottom: bool,
+        has_left: bool,
+        has_right: bool,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        weight = torch.ones((1, 1, 1, tile_h, tile_w), device=device, dtype=dtype)
+        if overlap_px <= 0:
+            return weight
+
+        ov_h = min(overlap_px, tile_h)
+        ov_w = min(overlap_px, tile_w)
+        if ov_h > 0:
+            if has_top:
+                ramp = torch.linspace(
+                    0.0, 1.0, steps=ov_h, device=device, dtype=torch.float32
+                ).to(dtype=dtype)
+                weight[:, :, :, :ov_h, :] *= ramp.view(1, 1, 1, ov_h, 1)
+            if has_bottom:
+                ramp = torch.linspace(
+                    1.0, 0.0, steps=ov_h, device=device, dtype=torch.float32
+                ).to(dtype=dtype)
+                weight[:, :, :, -ov_h:, :] *= ramp.view(1, 1, 1, ov_h, 1)
+        if ov_w > 0:
+            if has_left:
+                ramp = torch.linspace(
+                    0.0, 1.0, steps=ov_w, device=device, dtype=torch.float32
+                ).to(dtype=dtype)
+                weight[:, :, :, :, :ov_w] *= ramp.view(1, 1, 1, 1, ov_w)
+            if has_right:
+                ramp = torch.linspace(
+                    1.0, 0.0, steps=ov_w, device=device, dtype=torch.float32
+                ).to(dtype=dtype)
+                weight[:, :, :, :, -ov_w:] *= ramp.view(1, 1, 1, 1, ov_w)
+        return weight
+
+    def _decode_single_with_tiling(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [1, C, T, H, W]
+        _, _, _, latent_h, latent_w = z.shape
+        tile_size = max(1, int(self.tile_latent_min_size))
+        if tile_size <= 1:
+            return self.model.decode(z, scale=self.scale).clamp_(-1, 1)
+        if latent_h <= tile_size and latent_w <= tile_size:
+            return self.model.decode(z, scale=self.scale).clamp_(-1, 1)
+
+        overlap = int(tile_size * float(self.tile_overlap_factor))
+        overlap = max(1, min(overlap, tile_size - 1))
+        stride = tile_size - overlap
+        h_starts = self._tile_starts(latent_h, tile_size, stride)
+        w_starts = self._tile_starts(latent_w, tile_size, stride)
+
+        out_h = latent_h * self.ffactor_spatial
+        out_w = latent_w * self.ffactor_spatial
+        overlap_px = overlap * self.ffactor_spatial
+
+        merged = None
+        weight_sum = None
+
+        for h_start in h_starts:
+            h_end = min(h_start + tile_size, latent_h)
+            for w_start in w_starts:
+                w_end = min(w_start + tile_size, latent_w)
+                tile_z = z[:, :, :, h_start:h_end, w_start:w_end]
+                tile_video = self.model.decode(tile_z, scale=self.scale).clamp_(-1, 1)
+
+                if merged is None:
+                    _, c, t, _, _ = tile_video.shape
+                    merged = torch.zeros(
+                        (1, c, t, out_h, out_w),
+                        device=tile_video.device,
+                        dtype=tile_video.dtype,
+                    )
+                    weight_sum = torch.zeros(
+                        (1, 1, 1, out_h, out_w),
+                        device=tile_video.device,
+                        dtype=tile_video.dtype,
+                    )
+
+                out_y0 = h_start * self.ffactor_spatial
+                out_x0 = w_start * self.ffactor_spatial
+                out_y1 = out_y0 + tile_video.shape[-2]
+                out_x1 = out_x0 + tile_video.shape[-1]
+
+                weight = self._build_blend_weight(
+                    tile_h=tile_video.shape[-2],
+                    tile_w=tile_video.shape[-1],
+                    overlap_px=overlap_px,
+                    has_top=h_start > 0,
+                    has_bottom=h_end < latent_h,
+                    has_left=w_start > 0,
+                    has_right=w_end < latent_w,
+                    device=tile_video.device,
+                    dtype=tile_video.dtype,
+                )
+
+                merged[:, :, :, out_y0:out_y1, out_x0:out_x1] += tile_video * weight
+                weight_sum[:, :, :, out_y0:out_y1, out_x0:out_x1] += weight
+
+        if merged is None or weight_sum is None:
+            return self.model.decode(z, scale=self.scale).clamp_(-1, 1)
+        return merged / weight_sum.clamp_min(1e-6)
+
     def decode(self, zs, **kwargs):
+        decode_batch_size = kwargs.get(
+            "decode_batch_size", getattr(self, "decode_batch_size", 1)
+        )
+        use_slicing = bool(kwargs.get("enable_slicing", self.use_slicing))
+        use_tiling = bool(kwargs.get("enable_tiling", self.use_tiling))
+
+        if decode_batch_size is None:
+            decode_batch_size = 1
+        decode_batch_size = int(decode_batch_size)
+        if decode_batch_size <= 0:
+            decode_batch_size = zs.shape[0]
+        if use_slicing:
+            decode_batch_size = 1
+
         with amp.autocast(dtype=torch.float):
-            videos = [
-                self.model.decode(u.unsqueeze(0), scale=self.scale).clamp_(-1, 1).squeeze(0)
-                for u in zs
-            ]
-            videos = torch.stack(videos, dim=0)
-            return (videos, )
+            if decode_batch_size >= zs.shape[0] and not use_tiling:
+                videos = self.model.decode(zs, scale=self.scale).clamp_(-1, 1)
+                return (videos,)
+
+            videos = []
+            for start in range(0, zs.shape[0], decode_batch_size):
+                end = min(start + decode_batch_size, zs.shape[0])
+                chunk = zs[start:end]
+                if use_tiling:
+                    tiled = []
+                    for i in range(chunk.shape[0]):
+                        tiled.append(self._decode_single_with_tiling(chunk[i:i + 1]))
+                    chunk_videos = torch.cat(tiled, dim=0)
+                else:
+                    chunk_videos = self.model.decode(chunk, scale=self.scale).clamp_(-1, 1)
+                videos.append(chunk_videos)
+            videos = torch.cat(videos, dim=0)
+            return (videos,)
             
+

@@ -116,8 +116,17 @@ def maybe_load_fsdp_model(
             f"hsdp_replicate_dim * hsdp_shard_dim = {hsdp_replicate_dim}x{hsdp_shard_dim} <= 1, not using FSDP.")
 
     if use_fsdp:
+        mesh_device = "cuda"
+        try:
+            mesh_device = next(model.parameters()).device.type
+        except StopIteration:
+            pass
+        if mesh_device == "privateuseone":
+            mesh_device = "npu"
+        if mesh_device == "cpu":
+            mesh_device = "cuda"
         device_mesh = init_device_mesh(
-            "cuda",
+            mesh_device,
             # (Replicate(), Shard(dim=0))
             mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
             mesh_dim_names=("replicate", "shard"),

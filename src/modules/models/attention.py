@@ -5,6 +5,11 @@ import sys
 import torch
 from einops import rearrange
 
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+import math
+
 _FLASH_ATTN_IMPORT_ERROR = None
 
 try:
@@ -90,15 +95,28 @@ def attention(
     cu_seqlens_kv = attn_kwargs['cu_seqlens_kv']
     max_seqlen_q = attn_kwargs['max_seqlen_q']
     max_seqlen_kv = attn_kwargs['max_seqlen_kv']
-    x = flash_attn_varlen_func(
-        q.view(q.shape[0] * q.shape[1], *q.shape[2:]),
-        k.view(k.shape[0] * k.shape[1], *k.shape[2:]),
-        v.view(v.shape[0] * v.shape[1], *v.shape[2:]),
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        max_seqlen_q,
-        max_seqlen_kv,
-    )
+    head_num = q.shape[2]
+    x = torch_npu.npu_fusion_attention(
+            q.view(q.shape[0] * q.shape[1], *q.shape[2:]),
+            k.view(k.shape[0] * k.shape[1], *k.shape[2:]),
+            v.view(v.shape[0] * v.shape[1], *v.shape[2:]),
+            head_num,
+            pse=None,
+            atten_mask=None,
+            scale = 1.0 / math.sqrt(q.shape[-1]),
+            keep_prob=1,
+            input_layout="TND",
+            actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
+            actual_seq_kvlen=tuple(cu_seqlens_kv[1:].cpu().numpy().tolist()))[0]
+    #x = flash_attn_varlen_func(
+    #    q.view(q.shape[0] * q.shape[1], *q.shape[2:]),
+    #    k.view(k.shape[0] * k.shape[1], *k.shape[2:]),
+    #    v.view(v.shape[0] * v.shape[1], *v.shape[2:]),
+    #    cu_seqlens_q,
+     #   cu_seqlens_kv,
+    #    max_seqlen_q,
+    #    max_seqlen_kv,
+    #)
     output = x.view(
         batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
     )
