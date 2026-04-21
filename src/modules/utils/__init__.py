@@ -25,14 +25,22 @@ def maybe_init_distributed() -> bool:
     """Initialize torch distributed if WORLD_SIZE > 1. Returns True if initialized."""
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     if world_size <= 1:
+        from modules.distributed import reset_sequence_parallel_group
+        reset_sequence_parallel_group()
         return False
     rank = int(os.environ.get('RANK', '0'))
-    dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
+    backend = "hccl" if hasattr(torch, "npu") and torch.npu.is_available() else "nccl"
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+    from modules.distributed import init_sequence_parallel_group
+    init_sequence_parallel_group()
     return True
 
 
 def clean_dist_env() -> None:
     """Destroy the distributed process group if it was initialized."""
+    from modules.distributed import reset_sequence_parallel_group
+    reset_sequence_parallel_group()
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -63,3 +71,4 @@ def _dynamic_resize_from_bucket(image: Image, basesize: int = 512):
     target_height, target_width = bucket[-2], bucket[-1]  # (height, width)
     img_proc = resize_center_crop(image, (target_height, target_width))
     return img_proc
+
