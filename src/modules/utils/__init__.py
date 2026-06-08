@@ -17,6 +17,14 @@ def seed_everything(seed: int | None = None) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def env_to_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "1" if default else "0").strip()
+    try:
+        return bool(int(raw))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be 0 or 1, but got {raw!r}.") from exc
+
+
 # ---------------------------------------------------------------------------
 #  Distributed helpers (replaces modules.distributed.parallel_states)
 # ---------------------------------------------------------------------------
@@ -71,4 +79,3 @@ def _dynamic_resize_from_bucket(image: Image, basesize: int = 512):
     target_height, target_width = bucket[-2], bucket[-1]  # (height, width)
     img_proc = resize_center_crop(image, (target_height, target_width))
     return img_proc
-

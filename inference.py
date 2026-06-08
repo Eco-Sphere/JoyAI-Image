@@ -114,12 +114,9 @@ def is_rank0() -> bool:
 
 
 def resolve_device() -> torch.device:
-    #if not torch.cuda.is_available():
     if not torch_npu.npu.is_available():
         return torch.device('cpu')
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-    #torch.cuda.set_device(local_rank)
-    #return torch.device(f'cuda:{local_rank}')
     torch_npu.npu.set_device(local_rank)
     return torch.device(f'npu:{local_rank}')
 
@@ -139,7 +136,6 @@ def main() -> None:
     from infer_runtime.model import InferenceParams, build_model, preprocess_edit_image
     from infer_runtime.settings import load_settings
     from modules.utils import maybe_init_distributed, clean_dist_env
-    #from modules.models.attention import describe_attention_backend
 
     dist_initialized = False
     try:
@@ -154,7 +150,6 @@ def main() -> None:
 
         if is_rank0():
             print(f'Chosen device: {device}')
-        #    print(f'Attention backend: {describe_attention_backend()}')
             print(f'Config path: {settings.config_path}')
             print(f'Checkpoint path: {settings.ckpt_path}')
             if args.hsdp_shard_dim is not None:
@@ -256,4 +251,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

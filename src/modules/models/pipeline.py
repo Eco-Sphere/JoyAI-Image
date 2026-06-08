@@ -26,8 +26,6 @@ from dataclasses import dataclass
 from packaging import version
 from einops import rearrange
 
-from typing import Any
-
 from transformers import AutoProcessor
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -43,6 +41,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
 
 from modules.models.mmdit.dit import Transformer3DModel
+from modules.utils import env_to_bool
 
 try:
     from mindiesd import CacheAgent, CacheConfig
@@ -59,6 +58,11 @@ PRECISION_TO_TYPE = {
     'fp16': torch.float16,
     'bf16': torch.bfloat16,
 }
+
+
+def _raise_if_non_finite(tensor: torch.Tensor, name: str) -> None:
+    if not bool(torch.isfinite(tensor).all().item()):
+        raise FloatingPointError(f"{name} contains NaN or Inf.")
 
 
 def retrieve_timesteps(
@@ -675,16 +679,7 @@ class Pipeline(DiffusionPipeline):
 
     @staticmethod
     def _get_dit_cache_flags() -> Tuple[bool, bool]:
-        def _env_to_bool(name: str) -> bool:
-            value = os.environ.get(name, "0")
-            try:
-                return bool(int(value))
-            except ValueError as exc:
-                raise ValueError(
-                    f"Environment variable {name} must be 0 or 1, but got {value!r}."
-                ) from exc
-
-        return _env_to_bool("COND_CACHE"), _env_to_bool("UNCOND_CACHE")
+        return env_to_bool("COND_CACHE"), env_to_bool("UNCOND_CACHE")
 
     @staticmethod
     def _get_dit_cache_method() -> str:
@@ -1136,8 +1131,7 @@ class Pipeline(DiffusionPipeline):
                             use_cache=local_use_cache,
                             if_cond=branch_is_cond,
                         )[0]
-                        if (noise_pred.isnan()).any() or (noise_pred.isinf()).any():
-                            print("handle with nan/inf data")
+                        _raise_if_non_finite(noise_pred, "noise_pred")
                 elif self.do_classifier_free_guidance and (
                     cond_cache_enabled or uncond_cache_enabled
                 ):
@@ -1168,10 +1162,8 @@ class Pipeline(DiffusionPipeline):
                             use_cache=uncond_cache_enabled,
                             if_cond=False,
                         )[0]
-                        if (noise_pred_text.isnan()).any() or (noise_pred_text.isinf()).any():
-                            print("handle with nan/inf data (cond)")
-                        if (noise_pred_uncond.isnan()).any() or (noise_pred_uncond.isinf()).any():
-                            print("handle with nan/inf data (uncond)")
+                        _raise_if_non_finite(noise_pred_text, "noise_pred_text")
+                        _raise_if_non_finite(noise_pred_uncond, "noise_pred_uncond")
                 else:
                     # Default path: single forward (concat cond/uncond when CFG is enabled).
                     latent_model_input = (
@@ -1195,8 +1187,7 @@ class Pipeline(DiffusionPipeline):
                             use_cache=(cond_cache_enabled and not self.do_classifier_free_guidance),
                             if_cond=True,
                         )[0]
-                        if (noise_pred.isnan()).any() or (noise_pred.isinf()).any():
-                            print("handle with nan/inf data")
+                        _raise_if_non_finite(noise_pred, "noise_pred")
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1256,15 +1247,14 @@ class Pipeline(DiffusionPipeline):
                     f"Only support latents with shape (b, n, c, h, w) or (b, n, c, f, h, w), but got {latents.shape}."
                 )
 
-            if (latents.isnan()).any() or (latents.isinf()).any():
-                print("handle with nan/inf data")
+            _raise_if_non_finite(latents, "latents")
 
             # Decode latents (VAE handles denormalization internally via scale)
             latents = rearrange(
                 latents, "b n c f h w -> (b n) c f h w")
 
             with torch.autocast(
-                device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+                device_type=latents.device.type, dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
                 image = self.vae.decode(
                     latents, return_dict=False
@@ -1294,4 +1284,3 @@ class Pipeline(DiffusionPipeline):
             return image
 
         return PipelineOutput(videos=image)
-

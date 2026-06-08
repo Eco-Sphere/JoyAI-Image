@@ -5,7 +5,6 @@ import sys
 import torch
 from einops import rearrange
 
-import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 import math
@@ -58,8 +57,11 @@ def get_cu_seqlens(text_mask, img_len):
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
 
-    cu_seqlens = torch.zeros([2 * batch_size + 1],
-                             dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.zeros(
+        [2 * batch_size + 1],
+        dtype=torch.int32,
+        device=text_mask.device,
+    )
 
     for i in range(batch_size):
         s = text_len[i] + img_len
@@ -103,20 +105,11 @@ def attention(
             head_num,
             pse=None,
             atten_mask=None,
-            scale = 1.0 / math.sqrt(q.shape[-1]),
+            scale=1.0 / math.sqrt(q.shape[-1]),
             keep_prob=1,
             input_layout="TND",
             actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
             actual_seq_kvlen=tuple(cu_seqlens_kv[1:].cpu().numpy().tolist()))[0]
-    #x = flash_attn_varlen_func(
-    #    q.view(q.shape[0] * q.shape[1], *q.shape[2:]),
-    #    k.view(k.shape[0] * k.shape[1], *k.shape[2:]),
-    #    v.view(v.shape[0] * v.shape[1], *v.shape[2:]),
-    #    cu_seqlens_q,
-     #   cu_seqlens_kv,
-    #    max_seqlen_q,
-    #    max_seqlen_kv,
-    #)
     output = x.view(
         batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
     )
