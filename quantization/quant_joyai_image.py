@@ -28,7 +28,7 @@ from infer_runtime.infer_config import load_infer_config_class_from_pyfile
 from infer_runtime.settings import load_settings
 from modules.models import load_dit
 from quantization.config import get_joyai_image_quant_config
-from quantization.dump_utils import get_disable_layer_names
+from quantization.dump_utils import get_non_quantized_linear_names
 from quantization.quantizer import JoyAIImageQuantizer
 
 
@@ -152,7 +152,7 @@ def main():
     print(f"Loading JoyAI transformer from: {args.ckpt_root}")
     model, settings, _ = load_joyai_transformer(args, device=device)
 
-    disable_quant_layers = get_disable_layer_names(
+    disable_quant_layers = get_non_quantized_linear_names(
         model=model,
         layer_include=args.layer_include,
         layer_exclude=args.layer_exclude,

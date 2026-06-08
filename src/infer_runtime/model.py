@@ -11,7 +11,7 @@ from infer_runtime.infer_config import InferConfig, load_infer_config_class_from
 from infer_runtime.prompt_rewrite import rewrite_prompt
 from infer_runtime.settings import InferSettings
 from modules.models import load_dit, load_pipeline
-from modules.utils import _dynamic_resize_from_bucket, seed_everything
+from modules.utils import _dynamic_resize_from_bucket, env_to_bool, seed_everything
 
 try:
     _RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -42,19 +42,11 @@ def apply_transformer_quantization(transformer: torch.nn.Module, quant_desc_path
     use_nz = False if "w8a8_mxfp8" in quant_desc_path else True
     quantize(
         model=transformer,
-        quant_des_path=quant_desc_path,
+        quant_desc_path=quant_desc_path,
         use_nz=use_nz,
     )
     if hasattr(torch, "npu") and torch.npu.is_available():
         torch.npu.empty_cache()
-
-
-def _env_to_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "1" if default else "0").strip()
-    try:
-        return bool(int(raw))
-    except ValueError as exc:
-        raise ValueError(f"{name} must be 0 or 1, but got {raw!r}.") from exc
 
 
 def _env_to_optional_positive_int(name: str) -> int | None:
@@ -73,8 +65,8 @@ def _env_to_optional_positive_int(name: str) -> int | None:
 def configure_vae_runtime(
     vae: torch.nn.Module,
 ) -> list[str]:
-    vae_tiling = _env_to_bool("VAE_TILING", default=False)
-    vae_slicing = _env_to_bool("VAE_SLICING", default=False)
+    vae_tiling = env_to_bool("VAE_TILING", default=False)
+    vae_slicing = env_to_bool("VAE_SLICING", default=False)
     vae_decode_batch_size = _env_to_optional_positive_int("VAE_DECODE_BATCH_SIZE")
 
     messages: list[str] = []
@@ -283,11 +275,13 @@ def build_model(
     check_dependency_versions()
     seed_everything(settings.default_seed)
     if device is None:
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            device = torch.device("npu:0")
+        else:
+            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     return EditModel(
         settings=settings,
         device=device,
         hsdp_shard_dim_override=hsdp_shard_dim_override,
         quant_desc_path=quant_desc_path,
     )
-

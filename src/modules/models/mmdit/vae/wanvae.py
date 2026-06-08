@@ -556,7 +556,7 @@ class WanVAE_(nn.Module):
                 z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         if z.dtype != self.conv2.weight.dtype:
-            z=z.to(self.conv2.weight.dtype)
+            z = z.to(self.conv2.weight.dtype)
         x = self.conv2(z)
         for i in range(iter_):
             self._conv_idx = [0]
@@ -861,4 +861,3 @@ class WanxVAE(nn.Module):
             videos = torch.cat(videos, dim=0)
             return (videos,)
             
-
