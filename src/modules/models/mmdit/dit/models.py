@@ -1,4 +1,6 @@
-from typing import Any, List, Tuple, Optional, Union, Dict
+import os
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from einops import rearrange
 import math
 
@@ -11,10 +13,30 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 
+from modules.distributed import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+    seq_all_to_all_4d,
+)
 from modules.models.attention import attention, get_cu_seqlens
 
 from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 from .modulate_layers import load_modulation, modulate, apply_gate
+
+try:
+    from mindiesd import layernorm_scale_shift
+except ImportError:
+    layernorm_scale_shift = None
+
+
+ADALN_FUSE = bool(int(os.environ.get("ADALN_FUSE", 0)))
+COMM_OVERLAP = bool(int(os.environ.get("COMM_OVERLAP", 1)))
+QKV_A2A_OVERLAP = bool(int(os.environ.get("QKV_A2A_OVERLAP", 1)))
+
+
+def _wait_if_needed(x: Union[torch.Tensor, Any]) -> torch.Tensor:
+    return x() if callable(x) else x
 
 
 class RMSNorm(nn.Module):
@@ -155,6 +177,58 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.txt_mlp = FeedForward(hidden_size, inner_dim=mlp_hidden_dim,
                                    activation_fn="gelu-approximate")
+        self.use_adaln_fuse = ADALN_FUSE and layernorm_scale_shift is not None
+        self.enable_comm_overlap = COMM_OVERLAP
+        self.enable_qkv_a2a_overlap = QKV_A2A_OVERLAP and COMM_OVERLAP
+
+    def _layernorm_modulate(
+        self,
+        norm_layer: nn.LayerNorm,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_adaln_fuse:
+            return layernorm_scale_shift(
+                norm_layer,
+                x,
+                scale.unsqueeze(1),
+                shift.unsqueeze(1),
+                fused=True,
+            )
+
+        return modulate(norm_layer(x), shift=shift, scale=scale)
+
+    @staticmethod
+    def _can_split_qkv_projection(linear: nn.Module) -> bool:
+        out_features = getattr(linear, "out_features", None)
+        weight = getattr(linear, "weight", None)
+        if out_features is None:
+            return False
+        if weight is None or not torch.is_tensor(weight):
+            return False
+        if weight.ndim != 2:
+            return False
+        if out_features % 3 != 0:
+            return False
+        return weight.shape[0] >= out_features
+
+    @staticmethod
+    def _split_qkv_projection(
+        linear: nn.Module,
+        x: torch.Tensor,
+        qkv_index: int,
+    ) -> torch.Tensor:
+        if not MMDoubleStreamBlock._can_split_qkv_projection(linear):
+            raise TypeError(
+                f"QKV split projection requires Linear-like module with "
+                f"'out_features' and 2D tensor 'weight', but got {type(linear).__name__}."
+            )
+        hidden_size = linear.out_features // 3
+        start = qkv_index * hidden_size
+        end = start + hidden_size
+        bias = linear.bias[start:end] if linear.bias is not None else None
+        return F.linear(x, linear.weight[start:end], bias)
 
     def forward(
         self,
@@ -183,52 +257,110 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.txt_mod(vec)
 
-        # Prepare image for attention.
-        img_modulated = self.img_norm1(img)
-        img_modulated = modulate(
-            img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
+        sp_world_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_rank()
+        sp_enabled = sp_world_size > 1
+        sp_group = get_sp_group().device_group if sp_enabled else None
+
+        img_seq_len_local = img.shape[1]
+        img_seq_len_full = img_seq_len_local * sp_world_size if sp_enabled else img_seq_len_local
+
+        # Prepare image/txt for attention.
+        img_modulated = self._layernorm_modulate(
+            self.img_norm1, img, shift=img_mod1_shift, scale=img_mod1_scale
         )
-        img_qkv = self.img_attn_qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+        txt_modulated = self._layernorm_modulate(
+            self.txt_norm1, txt, shift=txt_mod1_shift, scale=txt_mod1_scale
         )
-        # Apply QK-Norm if needed
+
+        txt_q, txt_k, txt_v = None, None, None
+        can_split_img_qkv = self._can_split_qkv_projection(self.img_attn_qkv)
+        if sp_enabled and self.enable_qkv_a2a_overlap and can_split_img_qkv:
+            # Split QKV linear to overlap three image all_to_all ops with txt QKV GEMM.
+            img_q = self._split_qkv_projection(self.img_attn_qkv, img_modulated, 0).unflatten(
+                -1, (self.heads_num, -1)
+            )
+            img_q = seq_all_to_all_4d(
+                img_q, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=False
+            )
+
+            img_k = self._split_qkv_projection(self.img_attn_qkv, img_modulated, 1).unflatten(
+                -1, (self.heads_num, -1)
+            )
+            img_k = seq_all_to_all_4d(
+                img_k, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=False
+            )
+
+            img_v = self._split_qkv_projection(self.img_attn_qkv, img_modulated, 2).unflatten(
+                -1, (self.heads_num, -1)
+            )
+            img_v = seq_all_to_all_4d(
+                img_v, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=False
+            )
+
+            # txt stream compute masks img communication latency.
+            txt_qkv = self.txt_attn_qkv(txt_modulated)
+            txt_q, txt_k, txt_v = rearrange(
+                txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )
+
+            img_q = _wait_if_needed(img_q)
+            img_k = _wait_if_needed(img_k)
+            img_v = _wait_if_needed(img_v)
+        else:
+            img_qkv = self.img_attn_qkv(img_modulated)
+            img_q, img_k, img_v = rearrange(
+                img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )
+            if sp_enabled:
+                use_sync = not self.enable_comm_overlap
+                img_q = seq_all_to_all_4d(
+                    img_q, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=use_sync
+                )
+                img_k = seq_all_to_all_4d(
+                    img_k, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=use_sync
+                )
+                img_v = seq_all_to_all_4d(
+                    img_v, scatter_idx=2, gather_idx=1, group=sp_group, use_sync=use_sync
+                )
+                if self.enable_comm_overlap:
+                    img_q = _wait_if_needed(img_q)
+                    img_k = _wait_if_needed(img_k)
+                    img_v = _wait_if_needed(img_v)
+
+        # Apply QK-Norm if needed.
         img_q = self.img_attn_q_norm(img_q).to(img_v)
         img_k = self.img_attn_k_norm(img_k).to(img_v)
 
         # Apply RoPE if needed.
         if vis_freqs_cis is not None:
             img_qq, img_kk = apply_rotary_emb(
-                img_q, img_k, vis_freqs_cis, head_first=False)
+                img_q, img_k, vis_freqs_cis, head_first=False
+            )
             assert (
                 img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
             ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
             img_q, img_k = img_qq, img_kk
 
-        # Prepare txt for attention.
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = modulate(
-            txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
-        )
-        txt_qkv = self.txt_attn_qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
+        if txt_q is None:
+            txt_qkv = self.txt_attn_qkv(txt_modulated)
+            txt_q, txt_k, txt_v = rearrange(
+                txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+            )
+
         # Apply QK-Norm if needed.
         txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
         txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
 
         if txt_freqs_cis is not None:
             raise NotImplementedError("RoPE text is not supported for inference")
-            txt_qq, txt_kk = apply_rotary_emb(
-                txt_q, txt_k, txt_freqs_cis, head_first=False)
-            assert (
-                txt_qq.shape == txt_q.shape and txt_kk.shape == txt_k.shape
-            ), f"txt_kk: {txt_qq.shape}, txt_q: {txt_q.shape}, txt_kk: {txt_kk.shape}, txt_k: {txt_k.shape}"
-            txt_q, txt_k = txt_qq, txt_kk
+
+        if sp_enabled:
+            txt_q = torch.chunk(txt_q, sp_world_size, dim=2)[sp_rank].contiguous()
+            txt_k = torch.chunk(txt_k, sp_world_size, dim=2)[sp_rank].contiguous()
+            txt_v = torch.chunk(txt_v, sp_world_size, dim=2)[sp_rank].contiguous()
 
         # attention computation start
-
         q = torch.cat((img_q, txt_q), dim=1)
         k = torch.cat((img_k, txt_k), dim=1)
         v = torch.cat((img_v, txt_v), dim=1)
@@ -237,30 +369,47 @@ class MMDoubleStreamBlock(nn.Module):
             backend=self.attn_backend,
             attn_kwargs=attn_kwargs,
         )
-        attn = attn.flatten(2, 3)
         # attention computation end
-        img_attn, txt_attn = attn[:,
-                                    : img.shape[1]], attn[:, img.shape[1]:]
+        img_attn = attn[:, :img_seq_len_full]
+        txt_attn = attn[:, img_seq_len_full:]
+
+        if sp_enabled:
+            img_attn = seq_all_to_all_4d(
+                img_attn,
+                scatter_idx=1,
+                gather_idx=2,
+                group=sp_group,
+                use_sync=True,
+            )
+            txt_attn = get_sp_group().all_gather(
+                txt_attn,
+                dim=2,
+                async_op=self.enable_comm_overlap,
+            )
+
+        img_attn = img_attn.flatten(2, 3)
+        img_attn_proj = self.img_attn_proj(img_attn)
+        txt_attn = _wait_if_needed(txt_attn)
+        txt_attn = txt_attn.flatten(2, 3)
+        txt_attn_proj = self.txt_attn_proj(txt_attn)
 
         # Calculate the img bloks.
-        img = img + apply_gate(self.img_attn_proj(img_attn),
-                               gate=img_mod1_gate)
+        img = img + apply_gate(img_attn_proj, gate=img_mod1_gate)
         img = img + apply_gate(
             self.img_mlp(
-                modulate(
-                    self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale
+                self._layernorm_modulate(
+                    self.img_norm2, img, shift=img_mod2_shift, scale=img_mod2_scale
                 )
             ),
             gate=img_mod2_gate,
         )
 
         # Calculate the txt bloks.
-        txt = txt + apply_gate(self.txt_attn_proj(txt_attn),
-                               gate=txt_mod1_gate)
+        txt = txt + apply_gate(txt_attn_proj, gate=txt_mod1_gate)
         txt = txt + apply_gate(
             self.txt_mlp(
-                modulate(
-                    self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale
+                self._layernorm_modulate(
+                    self.txt_norm2, txt, shift=txt_mod2_shift, scale=txt_mod2_scale
                 )
             ),
             gate=txt_mod2_gate,
@@ -387,6 +536,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         self.proj_out = nn.Linear(
             hidden_size, out_channels * math.prod(patch_size),
             **factory_kwargs)
+        self.cache_cond = None
+        self.cache_uncond = None
 
 
     def get_rotary_pos_embed(self, vis_rope_size, txt_rope_size=None):
@@ -421,6 +572,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         return_dict: bool = True,
+        use_cache: bool = False,
+        if_cond: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         # For Multi-item Input: hidden_states: (b, n, c, t, h, w)
         # Permute the items into the temporal dimension
@@ -462,6 +615,14 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
 
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
+        sp_world_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_rank()
+        if sp_world_size > 1:
+            if img_seq_len % sp_world_size != 0:
+                raise ValueError(
+                    f"Image token length {img_seq_len} is not divisible by sequence parallel size {sp_world_size}."
+                )
+            img = torch.chunk(img, sp_world_size, dim=1)[sp_rank].contiguous()
 
         # rope
         vis_freqs_cis, txt_freqs_cis = self.get_rotary_pos_embed(vis_rope_size=(
@@ -484,17 +645,51 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             })
 
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
-            double_block_args = [
-                img,
-                txt,
-                vec,
-                vis_freqs_cis,
-                txt_freqs_cis,
-                attn_kwargs
-            ]
+        cache_agent = None
+        if use_cache:
+            cache_agent = self.cache_cond if if_cond else self.cache_uncond
 
-            img, txt = block(*double_block_args)
+        for _, block in enumerate(self.double_blocks):
+            if cache_agent is None:
+                img, txt = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    vis_freqs_cis=vis_freqs_cis,
+                    txt_freqs_cis=txt_freqs_cis,
+                    attn_kwargs=attn_kwargs,
+                )
+            else:
+                # mindiesd DiT cache expects `hidden_states` in kwargs.
+                def _cached_block_forward(
+                    hidden_states: torch.Tensor,
+                    encoder_hidden_states: torch.Tensor,
+                    vec: torch.Tensor,
+                    vis_freqs_cis: tuple,
+                    txt_freqs_cis: tuple,
+                    attn_kwargs: dict,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                    return block(
+                        img=hidden_states,
+                        txt=encoder_hidden_states,
+                        vec=vec,
+                        vis_freqs_cis=vis_freqs_cis,
+                        txt_freqs_cis=txt_freqs_cis,
+                        attn_kwargs=attn_kwargs,
+                    )
+
+                img, txt = cache_agent.apply(
+                    _cached_block_forward,
+                    hidden_states=img,
+                    encoder_hidden_states=txt,
+                    vec=vec,
+                    vis_freqs_cis=vis_freqs_cis,
+                    txt_freqs_cis=txt_freqs_cis,
+                    attn_kwargs=attn_kwargs,
+                )
+
+        if sp_world_size > 1:
+            img = get_sp_group().all_gather(img, dim=1, async_op=False)
 
         img_len = img.shape[1]
         x = torch.cat((img, txt), 1)
@@ -537,3 +732,4 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         imgs = x.reshape(shape=(x.shape[0], c, t * pt, h * ph, w * pw))
 
         return imgs
+

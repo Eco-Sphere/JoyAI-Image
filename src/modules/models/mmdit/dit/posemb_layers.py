@@ -1,5 +1,23 @@
+import os
+from typing import List, Tuple, Union
+
 import torch
-from typing import Union, Tuple, List
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
+
+ROPE_FUSE = bool(int(os.environ.get("ROPE_FUSE", 0)))
+
+
+def _apply_rotary_reference(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    return (x.float() * cos + rotate_half(x.float()) * sin).type_as(x)
 
 
 def _to_tuple(x, dim=2):
@@ -163,13 +181,27 @@ def apply_rotary_emb(
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
     """
-    xk_out = None
     cos, sin = reshape_for_broadcast(freqs_cis, xq, head_first)  # [S, D]
+
+    use_fused_rope = (
+        ROPE_FUSE
+        and torch_npu is not None
+        and xq.device.type == "npu"
+        and not head_first
+    )
+    if use_fused_rope:
+        # Keep the fused path aligned with Qwen's RoPE compute layout.
+        cos_npu = cos.to(device=xq.device, dtype=xq.dtype)
+        sin_npu = sin.to(device=xq.device, dtype=xq.dtype)
+        xq_out = torch_npu.npu_rotary_mul(xq, cos_npu, sin_npu, "interleave")
+        xk_out = torch_npu.npu_rotary_mul(xk, cos_npu, sin_npu, "interleave")
+        return xq_out.type_as(xq), xk_out.type_as(xk)
+
     cos, sin = cos.to(xq.device), sin.to(xq.device)
     # real * cos - imag * sin
     # imag * cos + real * sin
-    xq_out = (xq.float() * cos + rotate_half(xq.float()) * sin).type_as(xq)
-    xk_out = (xk.float() * cos + rotate_half(xk.float()) * sin).type_as(xk)
+    xq_out = _apply_rotary_reference(xq, cos, sin)
+    xk_out = _apply_rotary_reference(xk, cos, sin)
 
     return xq_out, xk_out
 
@@ -318,3 +350,4 @@ def get_1d_rotary_pos_embed(
             torch.ones_like(freqs), freqs
         )  # complex64     # [S, D/2]
         return freqs_cis
+
